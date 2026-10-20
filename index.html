@@ -169,6 +169,8 @@ const STEPS = [
   "4. 标签统一化",
   "5. 多平台汇总",
   "6. 打标（好差评汇总）",
+  "7. 分环节汇总",
+  "8. 导出成品",
 ];
 
 /* 全局运行时状态 */
@@ -462,6 +464,8 @@ function renderMain() {
   else if (APP.step === 3) renderStep4();
   else if (APP.step === 4) renderStep5();
   else if (APP.step === 5) renderStep6();
+  else if (APP.step === 6) renderStep7();
+  else if (APP.step === 7) renderStep8();
 }
 
 function renderAll() {
@@ -2734,7 +2738,7 @@ function g6GateStatusHtml(info) {
     parts.push(`${escapeHtml(cat)} ${ok ? "已确认" : "待确认"}`);
   }
   if (!parts.length) return `<div class="hint warn">还没有可确认的汇总。</div>`;
-  if (allOk) return `<div class="hint ok">${parts.join("　")}　→ 可以进入阶段 7（尚未移植）</div>`;
+  if (allOk) return `<div class="hint ok">${parts.join("　")}　→ 可以进入阶段 7（分环节汇总）</div>`;
   return `<div class="hint info">${parts.join("　")}　勾选后进入下一步</div>`;
 }
 
@@ -2977,6 +2981,665 @@ async function renderStep6Body() {
             (res.backup ? `<div class="caption" style="margin-top:6px">标签库已备份到 <span class="mono">${escapeHtml(res.backup)}</span></div>` : "");
         }
       });
+    };
+  }
+}
+
+
+/* ============================================================
+ * 阶段 7：分环节汇总（4-2）
+ * 移植自 常规打标流程/4-2分环节汇总.py
+ * ============================================================ */
+
+const G7_SHEET_SRC = "好差评汇总";
+const G7_SHEET_OUT = "分环节汇总";
+const G7_DEFAULT_CATEGORY = "产品口味";
+const G7_COLOR_TO_CATEGORY = {
+  "FFC000": "制作环节",
+  "00B050": "服务环节",
+  "7030A0": "设计&包装",
+  "FF0000": "品牌&市场",
+  "FFFF00": "价格",
+};
+const G7_EXCLUDED_POS = ["好吃，喜欢，推荐", "好喝，喜欢，推荐"];
+const G7_EXCLUDED_NEG = ["难吃，不喜欢，不推荐", "难喝，不喜欢，不推荐"];
+const G7_WIDTHS = [14, 12, 40, 12, 40];
+
+/* 取填充色的 6 位 RGB；无填充 / 非纯色返回 null */
+function g7FillKey(fill) {
+  if (!fill) return null;
+  if (fill.type && fill.type !== "pattern") return null;
+  if (!fill.pattern || fill.pattern === "none") return null;
+  const c = fill.fgColor || fill.start_color;
+  if (!c) return null;
+  let s = null;
+  if (typeof c.argb === "string") s = c.argb;
+  else if (typeof c.rgb === "string") s = c.rgb;
+  else if (typeof c.value === "string") s = c.value;
+  if (!s) return null;
+  s = s.toUpperCase();
+  if (s.length === 8) return s.slice(2);
+  if (s.length === 6) return s;
+  return null;
+}
+
+/* 按填充色判断环节：无填充或颜色不认识，一律算「产品口味」（与 Python 一致） */
+function g7CategoryOf(cell) {
+  const key = g7FillKey(cell.fill);
+  const cat = key ? G7_COLOR_TO_CATEGORY[key] : null;
+  return cat || G7_DEFAULT_CATEGORY;
+}
+
+function g7EmptyBuckets() {
+  const m = {};
+  for (const c of G6_CATEGORY_ORDER) m[c] = { total: 0, items: [] };
+  return m;
+}
+
+/* 复刻 read_summary_by_color：读「好差评汇总」C~F 列，按标签单元格填充色累计 */
+function g7ReadByColor(ws) {
+  const pos = g7EmptyBuckets();
+  const neg = g7EmptyBuckets();
+
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const posTagCell = ws.getCell(r, 3);
+    const posCntCell = ws.getCell(r, 4);
+    const negTagCell = ws.getCell(r, 5);
+    const negCntCell = ws.getCell(r, 6);
+
+    const posTag = g6CellValue(posTagCell);
+    const negTag = g6CellValue(negTagCell);
+
+    if (posTag === null && negTag === null) break;
+
+    for (const side of [
+      { tag: posTag, cntCell: posCntCell, tagCell: posTagCell, bucket: pos },
+      { tag: negTag, cntCell: negCntCell, tagCell: negTagCell, bucket: neg },
+    ]) {
+      if (side.tag === null) continue;
+      const t = String(side.tag).trim();
+      if (!t) continue;
+      const cv = g6CellValue(side.cntCell);
+      if (cv === null || cv === "") continue;
+      const n = Math.trunc(Number(cv));
+      if (Number.isNaN(n)) continue;
+      const cat = g7CategoryOf(side.tagCell);
+      side.bucket[cat].total += n;
+      side.bucket[cat].items.push([t, n]);
+    }
+  }
+
+  return { pos, neg };
+}
+
+/* 关键词格式：先剔总评标签，再取前两条；差评+产品口味带数量 */
+function g7FormatKeywords(items, isNeg, category) {
+  const ex = isNeg ? G7_EXCLUDED_NEG : G7_EXCLUDED_POS;
+  const filtered = items.filter((it) => ex.indexOf(it[0]) < 0);
+  if (!filtered.length) return null;
+  return filtered
+    .slice(0, 2)
+    .map(([tag, cnt]) => (isNeg && category === G7_DEFAULT_CATEGORY ? `${tag}(${cnt})` : tag))
+    .join("、");
+}
+
+/* 复刻 write_sheet2 */
+function g7WriteSheet(ws, pos, neg) {
+  const headers = ["分环节", "好评评论数", "好评主要关键词", "差评评论数", "差评主要关键词"];
+  headers.forEach((h, i) => {
+    const c = ws.getCell(1, i + 1);
+    c.value = h;
+    g6Bold(c);
+  });
+
+  // 按「好评数 + 差评数」降序；同值时保持 CATEGORY_ORDER 原顺序（JS 排序是稳定的）
+  const order = G6_CATEGORY_ORDER.slice().sort(
+    (a, b) => (pos[b].total + neg[b].total) - (pos[a].total + neg[a].total)
+  );
+
+  let r = 2;
+  for (const cat of order) {
+    const catCell = ws.getCell(r, 1);
+    catCell.value = cat;
+    const fill = g6Fill(G6_CATEGORY_COLORS[cat]);
+    if (fill) catCell.fill = fill;
+
+    const pt = pos[cat].total;
+    const nt = neg[cat].total;
+
+    const pb = ws.getCell(r, 2);
+    pb.value = pt > 0 ? pt : "/";
+    if (pt > 0) {
+      const kw = g7FormatKeywords(pos[cat].items, false, cat);
+      ws.getCell(r, 3).value = kw || "/";
+    } else {
+      ws.mergeCells(r, 2, r, 3);
+      pb.alignment = { horizontal: "center", vertical: "middle" };
+    }
+
+    const nd = ws.getCell(r, 4);
+    nd.value = nt > 0 ? nt : "/";
+    if (nt > 0) {
+      const kw = g7FormatKeywords(neg[cat].items, true, cat);
+      ws.getCell(r, 5).value = kw || "/";
+    } else {
+      ws.mergeCells(r, 4, r, 5);
+      nd.alignment = { horizontal: "center", vertical: "middle" };
+    }
+
+    r++;
+  }
+
+  G7_WIDTHS.forEach((w, i) => {
+    ws.getColumn(i + 1).width = w;
+  });
+
+  return order;
+}
+
+/* 复刻 apply_font_to_all_sheets：只换字体名，保留字号/加粗/颜色；空单元格跳过 */
+function g7ApplyFont(wb) {
+  wb.eachSheet((ws) => {
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (g6CellValue(cell) === null) return;
+        const old = cell.font || {};
+        const f = {};
+        for (const k of Object.keys(old)) {
+          if (k === "name" || k === "scheme" || k === "family") continue;
+          f[k] = old[k];
+        }
+        f.name = G6_FONT_NAME;
+        if (!f.size) f.size = 11;
+        cell.font = f;
+      });
+    });
+  });
+}
+
+/* 跑 4-2：读多平台汇总 → 重建「分环节汇总」→ 写回同一文件 */
+async function g7Run42(workDir, cat) {
+  const product = APP.state.product || "";
+  const fname = `${product}_${cat}_多平台汇总.xlsx`;
+  const fh = await getFile(workDir, fname, false);
+  const buf = await readFile(fh);
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+
+  const src = wb.getWorksheet(G7_SHEET_SRC);
+  if (!src) throw new Error("文件里没有「好差评汇总」，请先在阶段 6 跑一次 4-1 打标。");
+
+  const { pos, neg } = g7ReadByColor(src);
+
+  const old = wb.getWorksheet(G7_SHEET_OUT);
+  if (old) wb.removeWorksheet(old.id);
+
+  const ws = wb.addWorksheet(G7_SHEET_OUT);
+  const order = g7WriteSheet(ws, pos, neg);
+  g7ApplyFont(wb);
+
+  const out = await wb.xlsx.writeBuffer();
+  await writeFile(fh, out);
+
+  return {
+    order,
+    posTotal: order.reduce((s, c) => s + pos[c].total, 0),
+    negTotal: order.reduce((s, c) => s + neg[c].total, 0),
+  };
+}
+
+/* 读「分环节汇总」用于页面预览 */
+function g7ReadSheet(ws) {
+  const out = [];
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const cat = g6CellValue(ws.getCell(r, 1));
+    if (cat === null) continue;
+    out.push({
+      cat: String(cat),
+      pos: g6CellValue(ws.getCell(r, 2)),
+      posKw: g6CellValue(ws.getCell(r, 3)),
+      neg: g6CellValue(ws.getCell(r, 4)),
+      negKw: g6CellValue(ws.getCell(r, 5)),
+    });
+  }
+  return out;
+}
+
+function g7Swatch(cat) {
+  const c = G6_CATEGORY_COLORS[cat];
+  if (!c) return `<span style="display:inline-block;width:10px;height:10px;border:1px solid var(--border);border-radius:2px;margin-right:6px;vertical-align:middle"></span>`;
+  return `<span style="display:inline-block;width:10px;height:10px;background:#${c};border-radius:2px;margin-right:6px;vertical-align:middle"></span>`;
+}
+
+async function renderStep7() {
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <h2 style="font-size:16px;font-weight:500;margin-bottom:6px">分环节汇总</h2>
+    <p class="caption">按「好差评汇总」里标签的填充色归到一级环节，生成报告用的「分环节汇总」工作表（写在同一个文件里）。</p>
+    <div id="step7-body"></div>`;
+  await renderStep7Body();
+}
+
+async function renderStep7Body() {
+  const host = document.getElementById("step7-body");
+  const projDir = await getDir(APP.rootHandle, APP.curProject, true);
+  let workDir = null;
+  try {
+    workDir = await getDir(projDir, "work", false);
+  } catch (e) {
+    workDir = null;
+  }
+  if (!workDir) {
+    host.innerHTML = `<div class="card"><h3>还没有 work 目录</h3><div class="hint warn">先完成阶段 2 的预处理。</div></div>`;
+    return;
+  }
+
+  const product = APP.state.product || "";
+  const info = {};
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const fname = `${product}_${cat}_多平台汇总.xlsx`;
+    const has = await g6FileExists(workDir, fname);
+    let hasSummary = false;
+    let rows = null;
+    if (has) {
+      try {
+        const buf = await readFile(await getFile(workDir, fname, false));
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.load(buf);
+        hasSummary = !!wb.getWorksheet(G7_SHEET_SRC);
+        const ws = wb.getWorksheet(G7_SHEET_OUT);
+        if (ws) rows = g7ReadSheet(ws);
+      } catch (e) {
+        /* 读失败按未生成处理 */
+      }
+    }
+    info[cat] = { fname, has, hasSummary, rows };
+  }
+
+  let html = "";
+  const g2 = APP.state.gate2 || {};
+  const gateParts = [];
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    if (!info[cat].hasSummary) continue;
+    gateParts.push(`${escapeHtml(cat)} ${g2[cat] === true ? "已确认" : "未确认"}`);
+  }
+  if (gateParts.length && gateParts.some((s) => s.indexOf("未确认") >= 0)) {
+    html += `<div class="card"><div class="hint warn">关卡2 还没全部确认（${gateParts.join("　")}）。建议先回阶段 6 确认，再生成汇总。</div></div>`;
+  }
+
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const it = info[cat];
+    const key = cat === "国内自有" ? "own" : "third";
+
+    html += `<div class="card"><h3>${escapeHtml(cat)}</h3>
+      <div class="caption mono" style="font-size:12px">work/${escapeHtml(it.fname)}</div>`;
+
+    if (!it.has) {
+      html += `<div class="hint warn" style="margin-top:10px">汇总文件不存在，请先回到阶段 5 生成。</div></div>`;
+      continue;
+    }
+    if (!it.hasSummary) {
+      html += `<div class="hint warn" style="margin-top:10px">还没有「好差评汇总」，请先回到阶段 6 跑 4-1 打标。</div></div>`;
+      continue;
+    }
+
+    if (!it.rows) {
+      html += `<div class="hint info" style="margin-top:10px">还没有生成分环节汇总。</div>
+        <div style="margin-top:12px"><button id="g7-run-${key}">生成分环节汇总</button></div>
+        <div id="g7-status-${key}"></div></div>`;
+      continue;
+    }
+
+    const posSum = it.rows.reduce((s, x) => s + (typeof x.pos === "number" ? x.pos : 0), 0);
+    const negSum = it.rows.reduce((s, x) => s + (typeof x.neg === "number" ? x.neg : 0), 0);
+    html += `<div class="hint ok" style="margin-top:10px">已生成：好评 ${posSum} 条 / 差评 ${negSum} 条</div>`;
+
+    html += `<div style="margin-top:14px"><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr>
+      <th style="text-align:left;padding:4px 6px;border-bottom:1px solid var(--border);width:96px">分环节</th>
+      <th style="text-align:right;padding:4px 6px;border-bottom:1px solid var(--border);width:60px">好评数</th>
+      <th style="text-align:left;padding:4px 6px;border-bottom:1px solid var(--border)">好评关键词</th>
+      <th style="text-align:right;padding:4px 6px;border-bottom:1px solid var(--border);width:60px">差评数</th>
+      <th style="text-align:left;padding:4px 6px;border-bottom:1px solid var(--border)">差评关键词</th>
+    </tr></thead><tbody>`;
+
+    for (const row of it.rows) {
+      const pv = row.pos === null || row.pos === "" ? "/" : row.pos;
+      const nv = row.neg === null || row.neg === "" ? "/" : row.neg;
+      html += `<tr>
+        <td style="padding:5px 6px;border-bottom:1px solid var(--border)">${g7Swatch(row.cat)}${escapeHtml(row.cat)}</td>
+        <td style="padding:5px 6px;border-bottom:1px solid var(--border);text-align:right">${escapeHtml(String(pv))}</td>
+        <td style="padding:5px 6px;border-bottom:1px solid var(--border)">${escapeHtml(row.posKw ?? "")}</td>
+        <td style="padding:5px 6px;border-bottom:1px solid var(--border);text-align:right">${escapeHtml(String(nv))}</td>
+        <td style="padding:5px 6px;border-bottom:1px solid var(--border)">${escapeHtml(row.negKw ?? "")}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>
+
+      <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="secondary" id="g7-run-${key}">重新生成</button>
+      </div>
+      <div id="g7-status-${key}"></div>`;
+  }
+
+  html += `<div class="card"><h3>批量</h3>
+    <div class="caption">两个分类都生成一遍，已有的会被覆盖重算。</div>
+    <div style="margin-top:12px"><button id="g7-run-all">全部生成 / 重新生成</button></div>
+    <div id="g7-status-all"></div>
+  </div>`;
+
+  host.innerHTML = html;
+
+  const doOne = async (key, stEl, btn) => {
+    if (btn) btn.disabled = true;
+    if (stEl) stEl.innerHTML = `<div class="hint info" style="margin-top:8px">处理中…</div>`;
+    try {
+      const cat = key === "own" ? "国内自有" : "国内三方";
+      const r = await g7Run42(workDir, cat);
+      await renderStep7Body();
+      const after = document.getElementById(`g7-status-${key}`);
+      if (after) after.innerHTML = "";
+      return true;
+    } catch (e) {
+      const after = document.getElementById(`g7-status-${key}`);
+      if (after) after.innerHTML = `<div class="hint err" style="margin-top:8px">${escapeHtml(friendlyErr(e))}</div>`;
+      return false;
+    }
+  };
+
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const key = cat === "国内自有" ? "own" : "third";
+    const btn = document.getElementById(`g7-run-${key}`);
+    if (!btn) continue;
+    btn.onclick = () => doOne(key, document.getElementById(`g7-status-${key}`), btn);
+  }
+
+  const allBtn = document.getElementById("g7-run-all");
+  if (allBtn) {
+    allBtn.onclick = async () => {
+      allBtn.disabled = true;
+      const st = document.getElementById("g7-status-all");
+      st.innerHTML = `<div class="hint info" style="margin-top:8px">处理中…</div>`;
+      const done = [];
+      const skipped = [];
+      for (const cat of Object.keys(S_CATEGORIES)) {
+        if (!info[cat].hasSummary) {
+          skipped.push(cat);
+          continue;
+        }
+        try {
+          const r = await g7Run42(workDir, cat);
+          done.push(`${cat}（好评 ${r.posTotal} / 差评 ${r.negTotal}）`);
+        } catch (e) {
+          skipped.push(`${cat}：${friendlyErr(e)}`);
+        }
+      }
+      await renderStep7Body();
+      const after = document.getElementById("g7-status-all");
+      if (after) {
+        after.innerHTML =
+          (done.length ? `<div class="hint ok" style="margin-top:8px">已完成：${done.map(escapeHtml).join("　|　")}</div>` : "") +
+          (skipped.length ? `<div class="hint warn" style="margin-top:8px">跳过：${skipped.map(escapeHtml).join("　|　")}</div>` : "");
+      }
+    };
+  }
+}
+
+
+/* ============================================================
+ * 阶段 8：导出成品
+ * 报告版只留「好差评汇总」+「分环节汇总」；完整版原样复制
+ * ============================================================ */
+
+const G8_SHEETS_KEEP = ["好差评汇总", "分环节汇总"];
+const G8_EXPORT_SUBDIR = "exports";
+
+async function g8Scan(workDir) {
+  const product = APP.state.product || "";
+  const out = {};
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const fname = `${product}_${cat}_多平台汇总.xlsx`;
+    const has = await g6FileExists(workDir, fname);
+    let sheets = [];
+    if (has) {
+      try {
+        const buf = await readFile(await getFile(workDir, fname, false));
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.load(buf);
+        sheets = wb.worksheets.map((w) => w.name);
+      } catch (e) {
+        sheets = [];
+      }
+    }
+    out[cat] = {
+      fname,
+      has,
+      sheets,
+      okReport: G8_SHEETS_KEEP.every((n) => sheets.indexOf(n) >= 0),
+    };
+  }
+  return out;
+}
+
+async function g8ExportOne(workDir, cat, kind, targetDir) {
+  const product = APP.state.product || "";
+  const fname = `${product}_${cat}_多平台汇总.xlsx`;
+  const buf = await readFile(await getFile(workDir, fname, false));
+  const stamp = g6Stamp();
+  const base = safeName(`${product}_${cat}`);
+
+  if (kind === "full") {
+    const name = `${base}_完整_${stamp}.xlsx`;
+    const fh = await getFile(targetDir, name, true);
+    await writeFile(fh, buf);
+    return { name, sheets: null };
+  }
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  if (!wb.getWorksheet("分环节汇总")) {
+    throw new Error("还没有「分环节汇总」，请先在阶段 7 生成。");
+  }
+  wb.worksheets.slice().forEach((ws) => {
+    if (G8_SHEETS_KEEP.indexOf(ws.name) < 0) wb.removeWorksheet(ws.id);
+  });
+  const out = await wb.xlsx.writeBuffer();
+  const name = `${base}_报告_${stamp}.xlsx`;
+  const fh = await getFile(targetDir, name, true);
+  await writeFile(fh, out);
+  return { name, sheets: wb.worksheets.map((w) => w.name) };
+}
+
+async function g8ListExports(dirHandle) {
+  const out = [];
+  for await (const e of dirHandle.values()) {
+    if (e.kind === "file" && /\.xlsx$/i.test(e.name)) {
+      const f = await e.getFile();
+      out.push({ name: e.name, size: f.size, time: f.lastModified });
+    }
+  }
+  out.sort((a, b) => b.time - a.time);
+  return out;
+}
+
+async function renderStep8() {
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <h2 style="font-size:16px;font-weight:500;margin-bottom:6px">导出成品</h2>
+    <p class="caption">报告版只保留「好差评汇总」和「分环节汇总」两张表，体积小、可直接发；完整版原样复制全部工作表。</p>
+    <div id="step8-body"></div>`;
+  await renderStep8Body();
+}
+
+async function renderStep8Body() {
+  const host = document.getElementById("step8-body");
+  const projDir = await getDir(APP.rootHandle, APP.curProject, true);
+  let workDir = null;
+  try {
+    workDir = await getDir(projDir, "work", false);
+  } catch (e) {
+    workDir = null;
+  }
+  if (!workDir) {
+    host.innerHTML = `<div class="card"><h3>还没有 work 目录</h3><div class="hint warn">先完成阶段 2 的预处理。</div></div>`;
+    return;
+  }
+
+  const info = await g8Scan(workDir);
+  let exportDir = null;
+  try {
+    exportDir = await getDir(projDir, G8_EXPORT_SUBDIR, true);
+  } catch (e) {
+    exportDir = null;
+  }
+  const existing = exportDir ? await g8ListExports(exportDir) : [];
+
+  let html = "";
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const it = info[cat];
+    const key = cat === "国内自有" ? "own" : "third";
+    html += `<div class="card"><h3>${escapeHtml(cat)}</h3>
+      <div class="caption mono" style="font-size:12px">work/${escapeHtml(it.fname)}</div>`;
+
+    if (!it.has) {
+      html += `<div class="hint warn" style="margin-top:10px">汇总文件不存在。</div></div>`;
+      continue;
+    }
+
+    const chips = it.sheets
+      .map((s) => `<span class="caption" style="display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;margin-right:6px">${escapeHtml(s)}</span>`)
+      .join("");
+    html += `<div style="margin-top:10px">${chips}</div>`;
+
+    if (!it.okReport) {
+      const miss = G8_SHEETS_KEEP.filter((n) => it.sheets.indexOf(n) < 0);
+      html += `<div class="hint warn" style="margin-top:10px">还缺 ${miss.map(escapeHtml).join("、")}，报告版不可导出。</div>`;
+    }
+
+    html += `<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+      <button id="g8-report-${key}" ${it.okReport ? "" : "disabled"}>导出报告版</button>
+      <button class="secondary" id="g8-full-${key}">导出完整版</button>
+    </div>
+    <div id="g8-status-${key}"></div></div>`;
+  }
+
+  html += `<div class="card"><h3>导出位置</h3>
+    <div class="caption mono" style="font-size:12px">${escapeHtml(APP.curProject)}/${G8_EXPORT_SUBDIR}/</div>
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="secondary" id="g8-pick">导出到其他文件夹…</button>
+      <button class="secondary" id="g8-all">全部导出报告版</button>
+    </div>
+    <div id="g8-status-all"></div>
+    <div class="divider"></div>
+    <div class="caption" style="margin-bottom:8px">已有导出文件 ${existing.length} 个</div>
+    <div id="g8-list"></div>
+  </div>`;
+
+  host.innerHTML = html;
+
+  const renderList = (items) => {
+    const el = document.getElementById("g8-list");
+    if (!el) return;
+    if (!items.length) {
+      el.innerHTML = `<div class="caption">还没有导出过文件。</div>`;
+      return;
+    }
+    el.innerHTML = items
+      .map(
+        (f) => `<div class="row" style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+          <div class="col mono">${escapeHtml(f.name)}</div>
+          <div class="col" style="flex:0 0 90px;text-align:right;color:var(--text-3)">${(f.size / 1024).toFixed(1)} KB</div>
+        </div>`
+      )
+      .join("");
+  };
+  renderList(existing);
+
+  let targetDir = exportDir;
+  let targetLabel = `${APP.curProject}/${G8_EXPORT_SUBDIR}/`;
+
+  const pickBtn = document.getElementById("g8-pick");
+  if (pickBtn) {
+    pickBtn.onclick = async () => {
+      try {
+        const h = await window.showDirectoryPicker({ mode: "readwrite" });
+        targetDir = h;
+        targetLabel = h.name + "/";
+        const st = document.getElementById("g8-status-all");
+        st.innerHTML = `<div class="hint info" style="margin-top:8px">导出位置已切换为 <span class="mono">${escapeHtml(targetLabel)}</span></div>`;
+      } catch (e) {
+        /* 用户取消 */
+      }
+    };
+  }
+
+  const runExport = async (kind, key) => {
+    const stEl = document.getElementById(`g8-status-${key}`);
+    if (!targetDir) {
+      if (stEl) stEl.innerHTML = `<div class="hint err" style="margin-top:8px">没有可写入的目标文件夹。</div>`;
+      return null;
+    }
+    if (stEl) stEl.innerHTML = `<div class="hint info" style="margin-top:8px">导出中…</div>`;
+    try {
+      const cat = key === "own" ? "国内自有" : "国内三方";
+      const r = await g8ExportOne(workDir, cat, kind, targetDir);
+      if (stEl) {
+        stEl.innerHTML = `<div class="hint ok" style="margin-top:8px">已导出 <span class="mono">${escapeHtml(r.name)}</span> 到 ${escapeHtml(targetLabel)}</div>`;
+      }
+      return r;
+    } catch (e) {
+      if (stEl) stEl.innerHTML = `<div class="hint err" style="margin-top:8px">${escapeHtml(friendlyErr(e))}</div>`;
+      return null;
+    }
+  };
+
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const key = cat === "国内自有" ? "own" : "third";
+    const rb = document.getElementById(`g8-report-${key}`);
+    if (rb && !rb.disabled) {
+      rb.onclick = async () => {
+        rb.disabled = true;
+        await runExport("report", key);
+        rb.disabled = false;
+        if (targetDir === exportDir) renderList(await g8ListExports(exportDir));
+      };
+    }
+    const fb = document.getElementById(`g8-full-${key}`);
+    if (fb) {
+      fb.onclick = async () => {
+        fb.disabled = true;
+        await runExport("full", key);
+        fb.disabled = false;
+        if (targetDir === exportDir) renderList(await g8ListExports(exportDir));
+      };
+    }
+  }
+
+  const allBtn = document.getElementById("g8-all");
+  if (allBtn) {
+    allBtn.onclick = async () => {
+      allBtn.disabled = true;
+      const st = document.getElementById("g8-status-all");
+      st.innerHTML = `<div class="hint info" style="margin-top:8px">导出中…</div>`;
+      const done = [];
+      const failed = [];
+      for (const cat of Object.keys(S_CATEGORIES)) {
+        if (!info[cat].okReport) {
+          failed.push(`${cat}：缺工作表`);
+          continue;
+        }
+        try {
+          const r = await g8ExportOne(workDir, cat, "report", targetDir);
+          done.push(r.name);
+        } catch (e) {
+          failed.push(`${cat}：${friendlyErr(e)}`);
+        }
+      }
+      st.innerHTML =
+        (done.length ? `<div class="hint ok" style="margin-top:8px">已导出 ${done.length} 个文件到 ${escapeHtml(targetLabel)}</div>` : "") +
+        (failed.length ? `<div class="hint warn" style="margin-top:8px">未导出：${failed.map(escapeHtml).join("　|　")}</div>` : "");
+      allBtn.disabled = false;
+      if (targetDir === exportDir) renderList(await g8ListExports(exportDir));
     };
   }
 }
