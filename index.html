@@ -168,6 +168,7 @@ const STEPS = [
   "3. 线下打标往返（仅自有）",
   "4. 标签统一化",
   "5. 多平台汇总",
+  "6. 打标（好差评汇总）",
 ];
 
 /* 全局运行时状态 */
@@ -460,6 +461,7 @@ function renderMain() {
   else if (APP.step === 2) renderStep3();
   else if (APP.step === 3) renderStep4();
   else if (APP.step === 4) renderStep5();
+  else if (APP.step === 5) renderStep6();
 }
 
 function renderAll() {
@@ -2170,6 +2172,7 @@ async function renderStep5Body() {
     html += `<div style="margin-top:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <button id="btn-sum-${cat === "国内自有" ? "own" : "third"}">生成${cat}汇总（${ready} 个平台有数据）</button>
       <span class="caption">输出 work/&lt;产品&gt;_${cat}_多平台汇总.xlsx</span></div>
+      <div class="caption" style="margin-top:6px;color:var(--warn)">重新生成会整本覆盖该文件，已有的「好差评汇总」会被清掉，需回到阶段 6 重跑（阶段 6 有「重算本类别」，可以把两步串起来）。</div>
       <div id="sum-status-${cat === "国内自有" ? "own" : "third"}"></div></div>`;
   }
 
@@ -2260,6 +2263,720 @@ async function renderStep5Body() {
         status.innerHTML = `<div class="hint err" style="margin-top:8px">${escapeHtml(friendlyErr(e))}</div>`;
       }
       btn.disabled = false;
+    };
+  }
+}
+
+
+/* ============================================================
+ * 阶段 6：4-1 打标（好差评汇总）+ 关卡2 归类确认
+ * 移植自 常规打标流程/4-1打标.py + 打标工作流/pipeline.py
+ * ============================================================ */
+
+const G6_CATEGORY_ORDER = ["产品口味", "制作环节", "服务环节", "设计&包装", "品牌&市场", "价格"];
+const G6_CATEGORY_COLORS = {
+  "产品口味": null,
+  "制作环节": "FFC000",
+  "服务环节": "00B050",
+  "设计&包装": "7030A0",
+  "品牌&市场": "FF0000",
+  "价格": "FFFF00",
+};
+const G6_LIB_FILENAME = "自动打标签模版.xlsx";
+const G6_BACKUP_DIR = ".taglib_backup";
+const G6_FONT_NAME = "方正FW筑紫黑 简 R";
+const G6_FONT_SIZE = 10;
+const G6_POS_SUFFIX = "好评";
+const G6_NEG_SUFFIX = "差评";
+const G6_HEADER_SCAN_ROWS = 10;
+const G6_EXCLUDED = ["好评用户数", "差评用户数"];
+
+/* 取单元格的纯值：兼容富文本、公式、超链接 */
+function g6CellValue(cell) {
+  if (!cell) return null;
+  const v = cell.value;
+  if (v === null || v === undefined) return null;
+  if (typeof v === "object") {
+    if (v instanceof Date) return v;
+    if (Array.isArray(v.richText)) return v.richText.map((x) => x.text || "").join("");
+    if ("result" in v) return v.result;
+    if ("text" in v) return v.text;
+    if ("error" in v) return v.error;
+    return null;
+  }
+  return v;
+}
+
+function g6Fill(argb) {
+  if (!argb) return null;
+  return {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "FF" + argb },
+    bgColor: { argb: "FF" + argb },
+  };
+}
+
+function g6Bold(cell) {
+  const old = cell.font || {};
+  const f = {};
+  for (const k of Object.keys(old)) f[k] = old[k];
+  f.bold = true;
+  cell.font = f;
+}
+
+async function g6FileExists(dir, name) {
+  try {
+    await dir.getFileHandle(name);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ---------------- 标签库 ---------------- */
+
+async function g6LoadLibrary() {
+  if (typeof ExcelJS === "undefined") throw new Error("样式库未加载，请刷新页面");
+  if (!(await g6FileExists(APP.rootHandle, G6_LIB_FILENAME))) {
+    throw new Error(`数据目录根下缺少「${G6_LIB_FILENAME}」`);
+  }
+  const fh = await getFile(APP.rootHandle, G6_LIB_FILENAME, false);
+  const buf = await readFile(fh);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const ws = wb.worksheets[0];
+
+  const headerCols = {};
+  for (let c = 1; c <= ws.columnCount; c++) {
+    const v = g6CellValue(ws.getCell(1, c));
+    if (v === null) continue;
+    const name = String(v).trim();
+    if (G6_CATEGORY_ORDER.indexOf(name) >= 0 && !headerCols[name]) headerCols[name] = c;
+  }
+
+  const tagToCategory = {};
+  for (const cat of G6_CATEGORY_ORDER) {
+    const c = headerCols[cat];
+    if (!c) continue;
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const v = g6CellValue(ws.getCell(r, c));
+      if (v === null) continue;
+      const tag = String(v).trim();
+      if (!tag) continue;
+      if (!(tag in tagToCategory)) tagToCategory[tag] = cat;
+    }
+  }
+  return { wb, ws, fh, headerCols, tagToCategory };
+}
+
+function g6LibHasTag(ws, tag, colList) {
+  for (const c of colList) {
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const v = g6CellValue(ws.getCell(r, c));
+      if (v !== null && String(v).trim() === tag) return true;
+    }
+  }
+  return false;
+}
+
+function g6Stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/* 写标签库前先备份一份，出错可回滚 */
+async function g6BackupLibrary() {
+  const bakDir = await getDir(APP.rootHandle, G6_BACKUP_DIR, true);
+  const name = `自动打标签模版_${g6Stamp()}.xlsx`;
+  const src = await readFile(await getFile(APP.rootHandle, G6_LIB_FILENAME, false));
+  const out = await getFile(bakDir, name, true);
+  await writeFile(out, src);
+  return `${G6_BACKUP_DIR}/${name}`;
+}
+
+/* 把 {标签: 环节} 追加进标签库的工作表（纯逻辑，便于对账） */
+function g6AppendRows(ws, headerCols, mappings) {
+  const colList = Object.keys(headerCols).map((k) => headerCols[k]);
+  let rowCursor = ws.rowCount;
+  const added = {};
+
+  for (const rawTag of Object.keys(mappings)) {
+    const tag = String(rawTag).trim();
+    const cat = mappings[rawTag];
+    if (!tag || !(cat in headerCols)) continue;
+    if (g6LibHasTag(ws, tag, colList)) continue;
+    rowCursor += 1;
+    ws.getCell(rowCursor, headerCols[cat]).value = tag;
+    added[tag] = cat;
+  }
+  return added;
+}
+
+/* 把 {标签: 环节} 写进标签库并落盘，返回实际新增的 */
+async function g6AppendToLibrary(mappings) {
+  const lib = await g6LoadLibrary();
+  const added = g6AppendRows(lib.ws, lib.headerCols, mappings);
+  if (!Object.keys(added).length) return { added, backup: null };
+
+  const backup = await g6BackupLibrary();
+  const buf = await lib.wb.xlsx.writeBuffer();
+  await writeFile(lib.fh, buf);
+  return { added, backup };
+}
+
+/* ---------------- 4-1 打标：统计 / 写表 ---------------- */
+
+function g6FindHeaderRow(ws) {
+  const maxRow = Math.min(G6_HEADER_SCAN_ROWS, ws.rowCount);
+  for (let r = 1; r <= maxRow; r++) {
+    for (let c = 1; c <= ws.columnCount; c++) {
+      const v = g6CellValue(ws.getCell(r, c));
+      if (typeof v !== "string") continue;
+      const s = v.trim();
+      if (s.endsWith(G6_POS_SUFFIX) || s.endsWith(G6_NEG_SUFFIX)) return r;
+    }
+  }
+  throw new Error(`在前 ${G6_HEADER_SCAN_ROWS} 行中未找到以「好评」或「差评」结尾的表头`);
+}
+
+function g6FindLabelColumns(ws, headerRow) {
+  const pos = [], neg = [];
+  for (let c = 1; c <= ws.columnCount; c++) {
+    const v = g6CellValue(ws.getCell(headerRow, c));
+    if (typeof v !== "string") continue;
+    const s = v.trim();
+    if (s.endsWith(G6_POS_SUFFIX)) pos.push(c);
+    else if (s.endsWith(G6_NEG_SUFFIX)) neg.push(c);
+  }
+  if (!pos.length || !neg.length) throw new Error("未找到好评或差评标签列");
+  return { posCols: pos, negCols: neg };
+}
+
+function g6CountTags(ws) {
+  const headerRow = g6FindHeaderRow(ws);
+  const { posCols, negCols } = g6FindLabelColumns(ws, headerRow);
+  const pos = {}, neg = {};
+
+  const accumulate = (counter, labelCol) => {
+    const countCol = labelCol + 1;
+    for (let r = headerRow + 1; r <= ws.rowCount; r++) {
+      let tag = g6CellValue(ws.getCell(r, labelCol));
+      const count = g6CellValue(ws.getCell(r, countCol));
+      if (tag === null) continue;
+      tag = String(tag).trim();
+      if (!tag || G6_EXCLUDED.indexOf(tag) >= 0) continue;
+      if (count === null || typeof count !== "number") continue;
+      counter[tag] = (counter[tag] || 0) + count;
+    }
+  };
+
+  for (const c of posCols) accumulate(pos, c);
+  for (const c of negCols) accumulate(neg, c);
+
+  const ints = (o) => {
+    const out = {};
+    for (const k of Object.keys(o)) out[k] = Math.trunc(o[k]);
+    return out;
+  };
+  return { posCounter: ints(pos), negCounter: ints(neg) };
+}
+
+function g6SortedItems(counter) {
+  return Object.entries(counter).sort((a, b) => b[1] - a[1]);
+}
+
+/* 复刻 4-1打标.py 的 write_sheet1 */
+function g6WriteSummarySheet(ws, posItems, negItems, tagToCategory) {
+  ws.getCell(1, 1).value = "所属环节";
+  g6Bold(ws.getCell(1, 1));
+  ws.getCell(1, 3).value = "好评标签";
+  g6Bold(ws.getCell(1, 3));
+  ws.getCell(1, 4).value = "好评数量";
+  g6Bold(ws.getCell(1, 4));
+  ws.getCell(1, 5).value = "差评标签";
+  g6Bold(ws.getCell(1, 5));
+  ws.getCell(1, 6).value = "差评数量";
+  g6Bold(ws.getCell(1, 6));
+
+  ws.getCell(1, 9).value = "未找到对应一级标签的标签（未做颜色填充）";
+  g6Bold(ws.getCell(1, 9));
+  ws.getCell(2, 9).value = "好评未匹配标签";
+  g6Bold(ws.getCell(2, 9));
+  ws.getCell(2, 10).value = "好评数量";
+  g6Bold(ws.getCell(2, 10));
+  ws.getCell(2, 12).value = "差评未匹配标签";
+  g6Bold(ws.getCell(2, 12));
+  ws.getCell(2, 13).value = "差评数量";
+  g6Bold(ws.getCell(2, 13));
+
+  for (let i = 0; i < G6_CATEGORY_ORDER.length; i++) {
+    const cat = G6_CATEGORY_ORDER[i];
+    const cell = ws.getCell(2 + i, 1);
+    cell.value = cat;
+    const fill = g6Fill(G6_CATEGORY_COLORS[cat]);
+    if (fill) cell.fill = fill;
+  }
+
+  const unmatchedPos = {};
+  const unmatchedNeg = {};
+  const maxLen = Math.max(posItems.length, negItems.length);
+
+  for (let i = 0; i < maxLen; i++) {
+    const rowIdx = 2 + i;
+
+    if (i < posItems.length) {
+      const tag = posItems[i][0];
+      const count = posItems[i][1];
+      const cat = tagToCategory[tag];
+      if (cat === undefined) unmatchedPos[tag] = count;
+      const fill = g6Fill(cat === undefined ? null : G6_CATEGORY_COLORS[cat]);
+      const tCell = ws.getCell(rowIdx, 3);
+      const cCell = ws.getCell(rowIdx, 4);
+      tCell.value = tag;
+      cCell.value = count;
+      if (fill) {
+        tCell.fill = fill;
+        cCell.fill = fill;
+      }
+    }
+
+    if (i < negItems.length) {
+      const tag = negItems[i][0];
+      const count = negItems[i][1];
+      const cat = tagToCategory[tag];
+      if (cat === undefined) unmatchedNeg[tag] = count;
+      const fill = g6Fill(cat === undefined ? null : G6_CATEGORY_COLORS[cat]);
+      const tCell = ws.getCell(rowIdx, 5);
+      const cCell = ws.getCell(rowIdx, 6);
+      tCell.value = tag;
+      cCell.value = count;
+      if (fill) {
+        tCell.fill = fill;
+        cCell.fill = fill;
+      }
+    }
+  }
+
+  const posUn = Object.entries(unmatchedPos).sort((a, b) => b[1] - a[1]);
+  const negUn = Object.entries(unmatchedNeg).sort((a, b) => b[1] - a[1]);
+
+  for (let i = 0; i < posUn.length; i++) {
+    ws.getCell(3 + i, 9).value = posUn[i][0];
+    ws.getCell(3 + i, 10).value = posUn[i][1];
+  }
+  for (let i = 0; i < negUn.length; i++) {
+    ws.getCell(3 + i, 12).value = negUn[i][0];
+    ws.getCell(3 + i, 13).value = negUn[i][1];
+  }
+  if (!posUn.length && !negUn.length) {
+    ws.getCell(3, 9).value = "（全部标签均已匹配到一级标签）";
+  }
+
+  const widths = { 1: 14, 2: 4, 3: 24, 4: 10, 5: 24, 6: 10, 7: 4, 8: 4, 9: 24, 10: 10, 11: 4, 12: 24, 13: 10 };
+  for (const k of Object.keys(widths)) ws.getColumn(Number(k)).width = widths[k];
+
+  return {
+    posUn: Object.fromEntries(posUn),
+    negUn: Object.fromEntries(negUn),
+  };
+}
+
+/* 复刻 apply_font_to_all_sheets + set_font_size：所有有值单元格统一字体与字号 */
+function g6ApplyFont(wb) {
+  wb.eachSheet((ws) => {
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (g6CellValue(cell) === null) return;
+        const old = cell.font || {};
+        const f = {};
+        for (const k of Object.keys(old)) {
+          if (k === "name" || k === "size" || k === "scheme" || k === "family") continue;
+          f[k] = old[k];
+        }
+        f.name = G6_FONT_NAME;
+        f.size = G6_FONT_SIZE;
+        cell.font = f;
+      });
+    });
+  });
+}
+
+/* 跑 4-1：读汇总文件 → 统计 → 重建「好差评汇总」→ 写回 */
+async function g6Run41(workDir, cat) {
+  const product = APP.state.product || "";
+  const fname = `${product}_${cat}_多平台汇总.xlsx`;
+  const fh = await getFile(workDir, fname, false);
+  const buf = await readFile(fh);
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const src = wb.worksheets[0];
+
+  const lib = await g6LoadLibrary();
+  const { posCounter, negCounter } = g6CountTags(src);
+  const posItems = g6SortedItems(posCounter);
+  const negItems = g6SortedItems(negCounter);
+
+  const old = wb.getWorksheet("好差评汇总");
+  if (old) wb.removeWorksheet(old.id);
+
+  const ws = wb.addWorksheet("好差评汇总");
+  const un = g6WriteSummarySheet(ws, posItems, negItems, lib.tagToCategory);
+  g6ApplyFont(wb);
+
+  const out = await wb.xlsx.writeBuffer();
+  await writeFile(fh, out);
+
+  return {
+    posKinds: posItems.length,
+    negKinds: negItems.length,
+    posUn: un.posUn,
+    negUn: un.negUn,
+  };
+}
+
+/* 读「好差评汇总」：主表前 N 条 + 未匹配区 */
+function g6ReadSummarySheet(ws, maxRows) {
+  const limit = maxRows || 15;
+  const pos = [], neg = [];
+  const posUn = {}, negUn = {};
+
+  for (let r = 2; r <= ws.rowCount; r++) {
+    const a = g6CellValue(ws.getCell(r, 3));
+    const b = g6CellValue(ws.getCell(r, 4));
+    const e = g6CellValue(ws.getCell(r, 5));
+    const f = g6CellValue(ws.getCell(r, 6));
+    if (a !== null && typeof b === "number") pos.push([String(a).trim(), b]);
+    if (e !== null && typeof f === "number") neg.push([String(e).trim(), f]);
+  }
+
+  for (let r = 3; r <= ws.rowCount; r++) {
+    const a = g6CellValue(ws.getCell(r, 9));
+    const b = g6CellValue(ws.getCell(r, 10));
+    const l = g6CellValue(ws.getCell(r, 12));
+    const m = g6CellValue(ws.getCell(r, 13));
+    if (a !== null && typeof b === "number") posUn[String(a).trim()] = b;
+    if (l !== null && typeof m === "number") negUn[String(l).trim()] = m;
+  }
+
+  return { pos: pos.slice(0, limit), neg: neg.slice(0, limit), posKinds: pos.length, negKinds: neg.length, posUn, negUn };
+}
+
+/* ---------------- 阶段5 复算（一键重算用） ---------------- */
+
+async function g6RegenerateSummary(projDir, workDir, cat) {
+  const product = APP.state.product || "";
+  const dateRange = APP.state.date_range || "";
+  const label = cat === "国内自有" ? "自有" : "三方";
+  const multi = sIsMultiPeriod(dateRange);
+  const prev = multi ? await sLoadPrev(projDir, label) : null;
+  const hits = prev ? prev.hits : {};
+  const srcMap = await sResolveSources(workDir, cat, product);
+
+  const results = [];
+  const details = [];
+  for (const st of srcMap) {
+    const hit = hits[st.plat] || null;
+    let table = null;
+    if (st.hasFile) {
+      const buf = await readFile(st.file);
+      table = sReadTable(buf);
+      if (hit) {
+        table = sConcatTables(table, { headers: hit.headers, body: hit.body });
+        st.note = "含上一期";
+      } else {
+        st.note = "";
+      }
+    } else if (hit) {
+      table = { headers: hit.headers, body: hit.body };
+      st.note = "仅上一期";
+    }
+    if (!table) {
+      results.push({ name: st.plat, positive: [], negative: [], positiveUsers: 0, negativeUsers: 0 });
+      details.push(`${st.plat}：无数据`);
+      continue;
+    }
+    const r = sProcessPlatform(st.plat, table.headers, table.body);
+    results.push(r);
+    details.push(`${st.plat}：好评 ${r.positiveUsers} / 差评 ${r.negativeUsers}，标签 ${r.positive.length}+${r.negative.length}${st.note ? "（" + st.note + "）" : ""}`);
+  }
+
+  const outBuf = await sBuildSummaryFile(ExcelJS, cat, results, product, dateRange);
+  const fname = `${product}_${cat}_多平台汇总.xlsx`;
+  const fh = await getFile(workDir, fname, true);
+  await writeFile(fh, outBuf);
+  return { fname, details };
+}
+
+
+/* ---------------- 阶段 6 的 UI ---------------- */
+
+async function renderStep6() {
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <h2 style="font-size:16px;font-weight:500;margin-bottom:6px">打标（好差评汇总）+ 关卡2 归类确认</h2>
+    <p class="caption">把多平台汇总里的标签按一级环节归类，生成「好差评汇总」。未能匹配的标签在下方用下拉框指定环节，写入标签库后自动重跑。</p>
+    <div id="step6-body"></div>`;
+  await renderStep6Body();
+}
+
+function g6GateStatusHtml(info) {
+  const g2 = APP.state.gate2 || {};
+  const parts = [];
+  let allOk = true;
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const has = info[cat] && info[cat].has;
+    if (!has) continue;
+    const ok = g2[cat] === true;
+    if (!ok) allOk = false;
+    parts.push(`${escapeHtml(cat)} ${ok ? "已确认" : "待确认"}`);
+  }
+  if (!parts.length) return `<div class="hint warn">还没有可确认的汇总。</div>`;
+  if (allOk) return `<div class="hint ok">${parts.join("　")}　→ 可以进入阶段 7（尚未移植）</div>`;
+  return `<div class="hint info">${parts.join("　")}　勾选后进入下一步</div>`;
+}
+
+async function renderStep6Body() {
+  const host = document.getElementById("step6-body");
+  const projDir = await getDir(APP.rootHandle, APP.curProject, true);
+  let workDir = null;
+  try {
+    workDir = await getDir(projDir, "work", false);
+  } catch (e) {
+    workDir = null;
+  }
+  if (!workDir) {
+    host.innerHTML = `<div class="card"><h3>还没有 work 目录</h3><div class="hint warn">先完成阶段 2 的预处理。</div></div>`;
+    return;
+  }
+
+  const product = APP.state.product || "";
+
+  let lib = null;
+  let libErr = "";
+  try {
+    lib = await g6LoadLibrary();
+  } catch (e) {
+    libErr = friendlyErr(e);
+  }
+
+  const info = {};
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const fname = `${product}_${cat}_多平台汇总.xlsx`;
+    const has = await g6FileExists(workDir, fname);
+    let summary = null;
+    if (has) {
+      try {
+        const buf = await readFile(await getFile(workDir, fname, false));
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.load(buf);
+        const ws = wb.getWorksheet("好差评汇总");
+        if (ws) summary = g6ReadSummarySheet(ws);
+      } catch (e) {
+        summary = null;
+      }
+    }
+    info[cat] = { fname, has, summary };
+  }
+  APP._g6 = {};
+  APP._g6info = info;
+
+  let html = "";
+
+  if (libErr) {
+    html += `<div class="card"><h3>标签库</h3><div class="hint err">${escapeHtml(libErr)}</div>
+      <div class="caption" style="margin-top:6px">请把「${escapeHtml(G6_LIB_FILENAME)}」放到 projects 根目录。</div></div>`;
+  } else {
+    html += `<div class="card"><h3>标签库</h3>
+      <div class="hint ok">已载入 ${Object.keys(lib.tagToCategory).length} 个标签</div>
+      <div class="caption mono" style="margin-top:6px">projects/${escapeHtml(G6_LIB_FILENAME)}　（关卡2 的归类直接写回这一份）</div></div>`;
+  }
+
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const it = info[cat];
+    const key = cat === "国内自有" ? "own" : "third";
+    html += `<div class="card"><h3>${escapeHtml(cat)}</h3>
+      <div class="caption mono" style="font-size:12px">work/${escapeHtml(it.fname)}</div>`;
+
+    if (!it.has) {
+      html += `<div class="hint warn" style="margin-top:10px">汇总文件不存在，请先回到阶段 5 生成。</div></div>`;
+      continue;
+    }
+
+    if (!it.summary) {
+      html += `<div class="hint info" style="margin-top:10px">还没有跑过 4-1 打标。</div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button id="g6-run-${key}" ${libErr ? "disabled" : ""}>跑 4-1 打标</button>
+          <button class="secondary" id="g6-recalc-${key}" ${libErr ? "disabled" : ""}>重算本类别（阶段5 → 4-1）</button>
+        </div>
+        <div id="g6-status-${key}"></div></div>`;
+      continue;
+    }
+
+    const s = it.summary;
+    html += `<div class="hint ok" style="margin-top:10px">已生成：好评 ${s.posKinds} 种 / 差评 ${s.negKinds} 种</div>`;
+
+    html += `<div style="margin-top:14px"><div class="caption" style="margin-bottom:6px">已自动归类（前 15 条）</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr>
+        <th style="text-align:left;padding:4px 6px;border-bottom:1px solid var(--border)">好评标签</th>
+        <th style="text-align:right;padding:4px 6px;border-bottom:1px solid var(--border)">数量</th>
+        <th style="text-align:left;padding:4px 6px;border-bottom:1px solid var(--border)">差评标签</th>
+        <th style="text-align:right;padding:4px 6px;border-bottom:1px solid var(--border)">数量</th>
+      </tr></thead><tbody>`;
+    const n = Math.max(s.pos.length, s.neg.length);
+    for (let i = 0; i < n; i++) {
+      const p = s.pos[i] || ["", ""];
+      const q = s.neg[i] || ["", ""];
+      html += `<tr>
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border)">${escapeHtml(p[0])}</td>
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border);text-align:right">${p[1] === "" ? "" : p[1]}</td>
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border)">${escapeHtml(q[0])}</td>
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border);text-align:right">${q[1] === "" ? "" : q[1]}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+
+    const posList = Object.entries(s.posUn).sort((a, b) => b[1] - a[1]);
+    const negList = Object.entries(s.negUn).sort((a, b) => b[1] - a[1]);
+
+    if (!posList.length && !negList.length) {
+      html += `<div class="hint ok" style="margin-top:14px">没有未匹配标签，全部已归类。</div>`;
+    } else {
+      const rows = [];
+      for (const [t, c] of posList) rows.push({ kind: "好评", tag: t, cnt: c });
+      for (const [t, c] of negList) rows.push({ kind: "差评", tag: t, cnt: c });
+      APP._g6[cat] = rows;
+
+      html += `<div class="hint warn" style="margin-top:14px">有 ${posList.length} 个好评、${negList.length} 个差评标签未匹配到一级环节，请归类：</div>`;
+      html += `<div style="margin-top:10px">`;
+      rows.forEach((r, i) => {
+        html += `<div class="row" style="margin-top:8px">
+          <div class="col"><b>${escapeHtml(r.tag)}</b>　<span class="caption">${escapeHtml(r.kind)} · ${r.cnt} 次</span></div>
+          <div class="col" style="flex:0 0 176px">
+            <select class="g6-sel" data-cat="${escapeHtml(cat)}" data-i="${i}">
+              <option value="">（不归类）</option>
+              ${G6_CATEGORY_ORDER.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}
+            </select>
+          </div>
+        </div>`;
+      });
+      html += `</div>
+        <div style="margin-top:14px"><button id="g6-apply-${key}" disabled>应用归类并重跑 4-1</button></div>`;
+    }
+
+    html += `<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="secondary" id="g6-run-${key}">重跑 4-1 打标</button>
+      <button class="secondary" id="g6-recalc-${key}">重算本类别（阶段5 → 4-1）</button>
+    </div>
+    <div id="g6-status-${key}"></div>`;
+
+    const g2 = (APP.state.gate2 || {})[cat] === true;
+    html += `<div style="margin-top:16px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+      <input type="checkbox" id="g6-gate-${key}" ${g2 ? "checked" : ""}>
+      <span>我已确认 ${escapeHtml(cat)} 好差评汇总</span>
+    </label></div>`;
+
+    html += `</div>`;
+  }
+
+  html += `<div class="card" id="g6-gate-box">${g6GateStatusHtml(info)}</div>`;
+  host.innerHTML = html;
+
+  const btnBusy = async (key, fn) => {
+    const st = document.getElementById(`g6-status-${key}`);
+    if (st) st.innerHTML = `<div class="hint info" style="margin-top:8px">处理中…</div>`;
+    try {
+      await fn(st);
+    } catch (e) {
+      if (st) st.innerHTML = `<div class="hint err" style="margin-top:8px">${escapeHtml(friendlyErr(e))}</div>`;
+    }
+  };
+
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const key = cat === "国内自有" ? "own" : "third";
+
+    const runBtn = document.getElementById(`g6-run-${key}`);
+    if (runBtn) {
+      runBtn.onclick = () => {
+        runBtn.disabled = true;
+        btnBusy(key, async () => {
+          const r = await g6Run41(workDir, cat);
+          await renderStep6Body();
+          const after = document.getElementById(`g6-status-${key}`);
+          if (after) {
+            const un = Object.keys(r.posUn).length + Object.keys(r.negUn).length;
+            after.innerHTML = `<div class="hint ok" style="margin-top:8px">已完成：好评 ${r.posKinds} 种 / 差评 ${r.negKinds} 种${un ? "，有未匹配标签待归类" : ""}</div>`;
+          }
+        });
+      };
+    }
+
+    const recalcBtn = document.getElementById(`g6-recalc-${key}`);
+    if (recalcBtn) {
+      recalcBtn.onclick = () => {
+        recalcBtn.disabled = true;
+        btnBusy(key, async () => {
+          const gen = await g6RegenerateSummary(projDir, workDir, cat);
+          const r = await g6Run41(workDir, cat);
+          await renderStep6Body();
+          const after = document.getElementById(`g6-status-${key}`);
+          if (after) {
+            after.innerHTML = `<div class="hint ok" style="margin-top:8px">已重算汇总并跑完 4-1（好评 ${r.posKinds} / 差评 ${r.negKinds} 种）</div>` +
+              `<div class="caption" style="margin-top:6px">${gen.details.map(escapeHtml).join("　|　")}</div>`;
+          }
+        });
+      };
+    }
+
+    const gate = document.getElementById(`g6-gate-${key}`);
+    if (gate) {
+      gate.onchange = async () => {
+        APP.state.gate2 = APP.state.gate2 || {};
+        APP.state.gate2[cat] = gate.checked;
+        await saveState();
+        const box = document.getElementById("g6-gate-box");
+        if (box) box.innerHTML = g6GateStatusHtml(APP._g6info);
+      };
+    }
+  }
+
+  document.querySelectorAll(".g6-sel").forEach((sel) => {
+    sel.onchange = () => {
+      const cat = sel.dataset.cat;
+      const key = cat === "国内自有" ? "own" : "third";
+      const btn = document.getElementById(`g6-apply-${key}`);
+      if (!btn) return;
+      const any = Array.from(document.querySelectorAll(".g6-sel")).some((x) => x.dataset.cat === cat && x.value);
+      btn.disabled = !any;
+    };
+  });
+
+  for (const cat of Object.keys(S_CATEGORIES)) {
+    const key = cat === "国内自有" ? "own" : "third";
+    const btn = document.getElementById(`g6-apply-${key}`);
+    if (!btn) continue;
+    btn.onclick = () => {
+      const rows = APP._g6[cat] || [];
+      const mappings = {};
+      Array.from(document.querySelectorAll(".g6-sel")).forEach((sel) => {
+        if (sel.dataset.cat !== cat || !sel.value) return;
+        const i = Number(sel.dataset.i);
+        if (rows[i]) mappings[rows[i].tag] = sel.value;
+      });
+      if (!Object.keys(mappings).length) return;
+      btn.disabled = true;
+      btnBusy(key, async () => {
+        const res = await g6AppendToLibrary(mappings);
+        const r = await g6Run41(workDir, cat);
+        await renderStep6Body();
+        const after = document.getElementById(`g6-status-${key}`);
+        if (after) {
+          after.innerHTML = `<div class="hint ok" style="margin-top:8px">已新增 ${Object.keys(res.added).length} 个标签并重跑（好评 ${r.posKinds} / 差评 ${r.negKinds} 种）</div>` +
+            (res.backup ? `<div class="caption" style="margin-top:6px">标签库已备份到 <span class="mono">${escapeHtml(res.backup)}</span></div>` : "");
+        }
+      });
     };
   }
 }
