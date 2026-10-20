@@ -118,6 +118,7 @@ const STEPS = [
   "1. 导入原始数据",
   "2. 预处理（筛品/拆分）",
   "3. 线下打标往返（仅自有）",
+  "4. 标签统一化",
 ];
 
 /* 全局运行时状态 */
@@ -408,6 +409,7 @@ function renderMain() {
   if (APP.step === 0) renderStep1();
   else if (APP.step === 1) renderStep2();
   else if (APP.step === 2) renderStep3();
+  else if (APP.step === 3) renderStep4();
 }
 
 function renderAll() {
@@ -1007,6 +1009,631 @@ async function handleReturn(plat, file) {
 async function refreshProjects() {
   APP.projects = await scanProjects();
   renderAll();
+}
+
+/* ============================================================
+ * 阶段 4：标签统一化
+ * 移植自 常规打标流程/1-标签统一化.py + 打标工作流/pipeline.py
+ * （apply_synonym_mapping / load_synonym_map）
+ * ============================================================ */
+
+const U_MAP_FILENAME = "近义映射表.xlsx";
+const U_SENTIMENT_TITLE = "情感识别";
+const U_TAG_TITLES = ["评价1-对应标签", "评价2-对应标签", "评价3-对应标签", "评价4-对应标签", "评价5-对应标签"];
+const U_DROP_COLUMNS = ["评价1-好/差评", "评价2-好/差评", "评价3-好/差评", "评价4-好/差评", "评价5-好/差评"];
+const U_DELETE_CONTENT_KEYWORDS = ["拼单", "复刻", "拼买一送一"];
+const U_DELETE_TAG_KEYWORDS = ["很想尝试", "没喝到"];
+const U_SPLIT_RE = /[、,，;；|]/;
+const U_SPLIT_PATTERN = /[、,，;；|]\s*/;
+const U_ATOMIC_TAGS = ["好喝，喜欢，推荐", "难喝，不喜欢，不推荐", "好吃，喜欢，推荐", "难吃，不喜欢，不推荐"];
+
+const U_GLOBAL_REPLACE = {
+  "奶盖": "云顶",
+  "啵啵": "波波",
+  "珍珠": "波波",
+  "番石榴": "芭乐",
+  "员工": "店员",
+  "麻薯": "糯糯",
+  "卡片": "小卡",
+  "没味道": "寡淡",
+};
+
+const U_POS_RULES = [
+  ["清爽不腻", ["清爽", "不腻", "清爽解腻", "解腻清爽", "清爽可口", "清鲜", "解腻"], ["清爽"]],
+  ["喜欢云顶", ["云顶好吃"], []],
+  ["茶香浓郁", ["茶味浓郁", "茶味突出", "茶香突出", "茶底味道明显"], []],
+  ["茶香清香", ["茶味清香", "茶香清淡", "茶味清爽", "茶味明显", "茶味清淡"], []],
+  ["果香浓郁", ["果味浓郁", "果味突出", "果香突出"], []],
+  ["果香清香", ["果香清香", "果味清香", "果味清新"], []],
+  ["奶香浓郁", ["奶味浓郁"], []],
+  ["口感细腻/丝滑", ["口感细腻", "口感丝滑"], []],
+  ["口味独特", ["口味新奇", "口感独特"], []],
+  ["喜欢冰饮", ["冰的好喝"], []],
+  ["喜欢热饮", ["热的好喝"], []],
+  ["喜欢苦巧", ["喜欢巧克力", "苦巧好吃", "巧克力好吃"], []],
+  ["喜欢黑糖波波", ["喜欢波波", "黑糖波波好吃"], []],
+  ["可可味浓郁", ["巧克力味浓郁"], []],
+  ["果肉新鲜", ["水果新鲜", "水果品质好"], []],
+  ["包装设计好", ["包装好看"], []],
+  ["喜欢酸涩感", ["酸涩感", "酸涩感满意", "满意酸涩味"], []],
+  ["够酸", ["酸味很足"], []],
+  ["好喝，喜欢，推荐", ["味道不错", "口味不错", "满意", "味道好", "还不错", "好喝"], []],
+  ["出餐/配送快", ["出餐快", "配送快"], []],
+  ["不甜/腻", ["不甜"], []],
+  ["好吃，喜欢，推荐", ["蛋糕好吃", "蛋糕不错"], []],
+  ["性价比高", ["价格便宜"], []],
+];
+
+const U_NEG_RULES = [
+  ["难喝，不喜欢，不推荐", ["难喝", "不喜欢", "不推荐"], []],
+  ["太甜", ["有点甜", "偏甜", "太甜"], []],
+  ["太酸", ["有点酸", "偏酸", "太酸"], []],
+  ["味道寡淡", ["没味道"], ["寡淡", "没味道", "口感淡"]],
+  ["产品无特色", ["无记忆点"], ["无特色", "没特色", "没亮点", "无亮点", "缺乏特色"]],
+  ["不够酸", ["酸味不足"], []],
+  ["性价比低/贵", ["偏贵", "价格贵", "价格太高"], []],
+  ["出餐/配送慢", ["出餐慢", "配送慢"], []],
+  ["点单/排队慢", ["排队太长", "排队时间长", "排队长", "排队太久", "排队久"], []],
+  ["没给/给错吸管", ["没给吸管", "给错吸管"], []],
+];
+
+function uNormHeader(v) {
+  return v == null ? "" : String(v).replace(/\s+/g, "");
+}
+
+function uEscapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function uBuildRules(rules) {
+  const canonicalSet = new Set();
+  const exactMap = new Map();
+  const keywordRules = [];
+  for (const [canonical, aliases, keywords] of rules) {
+    const c = String(canonical).trim();
+    canonicalSet.add(c);
+    for (const a of aliases || []) {
+      const t = String(a).trim();
+      if (t) exactMap.set(t, c);
+    }
+    for (const k of keywords || []) {
+      const t = String(k).trim();
+      if (t) keywordRules.push([t, c]);
+    }
+  }
+  keywordRules.sort((a, b) => b[0].length - a[0].length);
+  return { canonicalSet, exactMap, keywordRules };
+}
+
+const U_POS = uBuildRules(U_POS_RULES);
+const U_NEG = uBuildRules(U_NEG_RULES);
+
+/* 转折复合标签（如「好喝，但茶味淡」）整段保护，不参与拆分与归一 */
+const U_TURN_WORDS = ["但", "不过", "然而", "可惜", "就是", "美中不足"];
+const U_TURN_WORD_SRC = "(?:" + U_TURN_WORDS.join("|") + ")(?=[^、,，;；|]|$)";
+const U_TURN_SEP_RE = new RegExp("[^、,，;；|]*[、,，;；|]\\s*" + U_TURN_WORD_SRC + "[^、,，;；|]*");
+const U_TURN_HEAD_RE = new RegExp("^\\s*" + U_TURN_WORD_SRC);
+const U_TURN_RE = new RegExp(U_TURN_WORD_SRC);
+
+function uIsTurnCompound(text) {
+  if (!text) return false;
+  const s = String(text).trim();
+  if (!s) return false;
+  if (U_TURN_SEP_RE.test(s)) return true;
+  if (U_TURN_HEAD_RE.test(s)) return true;
+  const m = U_TURN_RE.exec(s);
+  if (m && m.index > 0) return true;
+  return false;
+}
+
+/* 程度 / 比较副词开头时不做「X好吃 → 喜欢X」转换
+ * 原版正则会产出「比蛋糕好吃 → 喜欢比蛋糕」「很好吃 → 喜欢很」这类无意义标签 */
+const U_DEGREE_PREFIX = /^(?:比|很|超|太|挺|好|最|更|真|巨|贼|特别|非常|十分|相当|有点|稍微|略微)/;
+
+function uGlobalReplace(text) {
+  let s = text == null ? "" : String(text);
+  for (const [old, nw] of Object.entries(U_GLOBAL_REPLACE)) {
+    s = s.split(old).join(nw);
+  }
+  return s;
+}
+
+function uNormalizeOneLabel(label, R) {
+  if (label == null) return "";
+  let s = String(label).trim();
+  if (!s) return "";
+  s = uGlobalReplace(s);
+  s = s.replace(/没加([^，,;；]+)/g, "漏加$1");
+  s = s.replace(/比([^，,;；]+)难喝/g, "不如$1好喝");
+  let m = /^(.+)好吃$/.exec(s);
+  if (m && !U_DEGREE_PREFIX.test(m[1])) s = "喜欢" + m[1];
+  m = /^(.+)还可以$/.exec(s);
+  if (m && !U_DEGREE_PREFIX.test(m[1])) s = "喜欢" + m[1];
+  if (R.canonicalSet.has(s)) return s;
+  if (R.exactMap.has(s)) return R.exactMap.get(s);
+  for (const [kw, canonical] of R.keywordRules) {
+    if (s.includes(kw)) return canonical;
+  }
+  return s;
+}
+
+function uNormalizeCellText(text, R) {
+  if (text == null) return "";
+  let s = String(text).trim();
+  if (!s) return "";
+  if (uIsTurnCompound(s)) return s;
+
+  const protectedList = [];
+  const sepCanon = [...R.canonicalSet]
+    .filter((c) => U_SPLIT_RE.test(c))
+    .sort((a, b) => b.length - a.length);
+  if (sepCanon.length) {
+    const re = new RegExp(sepCanon.map(uEscapeRe).join("|"), "g");
+    s = s.replace(re, (mm) => {
+      protectedList.push(mm);
+      return "\x00" + (protectedList.length - 1) + "\x00";
+    });
+  }
+
+  let parts = s.split(U_SPLIT_PATTERN).map((p) => p.trim()).filter(Boolean);
+  if (!parts.length) parts = [s];
+
+  const out = [];
+  const seen = new Set();
+  for (const part of parts) {
+    let nl;
+    if (/^\x00\d+\x00$/.test(part)) {
+      nl = protectedList[parseInt(part.replace(/\x00/g, ""), 10)];
+    } else {
+      nl = uNormalizeOneLabel(part, R);
+    }
+    if (nl && !seen.has(nl)) {
+      out.push(nl);
+      seen.add(nl);
+    }
+  }
+  if (out.length === parts.length && out.every((v, i) => v === parts[i])) return s;
+  return out.join("、");
+}
+
+function uBuildHeaderMap(rows) {
+  const map = new Map();
+  const hdr = rows[0] || [];
+  hdr.forEach((v, i) => {
+    const k = uNormHeader(v);
+    if (k) map.set(k, i);
+  });
+  return map;
+}
+
+function uResolveCol(headerMap, title) {
+  const key = uNormHeader(title);
+  if (!headerMap.has(key)) throw new Error("找不到表头：" + title);
+  return headerMap.get(key);
+}
+
+function uDropColumns(rows, titles) {
+  const hdr = rows[0] || [];
+  const keys = new Set(titles.map(uNormHeader));
+  const drop = new Set();
+  hdr.forEach((v, i) => {
+    if (keys.has(uNormHeader(v))) drop.add(i);
+  });
+  if (!drop.size) return rows;
+  return rows.map((r) => {
+    const row = r || [];
+    const out = [];
+    for (let i = 0; i < row.length; i++) {
+      if (!drop.has(i)) out.push(row[i]);
+    }
+    return out;
+  });
+}
+
+function uMarkRowsForManual(rows, headerMap) {
+  const contentCol = uResolveCol(headerMap, "内容");
+  const tagCols = U_TAG_TITLES.map((t) => headerMap.get(uNormHeader(t))).filter((c) => c != null);
+  if (!tagCols.length) throw new Error("未找到任何评价标签列（评价1~5-对应标签）");
+  const remove = new Set();
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const content = row[contentCol] == null ? "" : String(row[contentCol]);
+    if (U_DELETE_CONTENT_KEYWORDS.some((k) => content.includes(k))) {
+      remove.add(r);
+      continue;
+    }
+    for (const c of tagCols) {
+      const v = row[c];
+      if (v == null) continue;
+      if (U_DELETE_TAG_KEYWORDS.some((k) => String(v).includes(k))) {
+        remove.add(r);
+        break;
+      }
+    }
+  }
+  return remove;
+}
+
+/* 主处理：删冗余列 → 标记手动识别行 → 按情感归一标签 → 拆出清洗结果/手动识别 */
+function uProcessRows(rows) {
+  const work = uDropColumns(rows, U_DROP_COLUMNS);
+  const headerMap = uBuildHeaderMap(work);
+  const rowsToRemove = uMarkRowsForManual(work, headerMap);
+  const sentimentCol = uResolveCol(headerMap, U_SENTIMENT_TITLE);
+  const tagCols = U_TAG_TITLES.map((t) => headerMap.get(uNormHeader(t))).filter((c) => c != null);
+
+  let changedCells = 0;
+  const changedSamples = [];
+
+  for (let r = 1; r < work.length; r++) {
+    if (rowsToRemove.has(r)) continue;
+    const row = work[r];
+    if (!row) continue;
+    const sv = row[sentimentCol];
+    if (sv == null) continue;
+    const sentiment = String(sv).trim();
+    let R;
+    if (sentiment === "正向") R = U_POS;
+    else if (sentiment === "负向") R = U_NEG;
+    else continue;
+    for (const c of tagCols) {
+      const old = row[c];
+      if (old == null || String(old).trim() === "") continue;
+      const nv = uNormalizeCellText(old, R);
+      if (nv !== String(old)) {
+        changedCells++;
+        if (changedSamples.length < 6) changedSamples.push(String(old) + " → " + nv);
+        row[c] = nv;
+      }
+    }
+  }
+
+  const cleanRows = [work[0] || []];
+  const manualRows = [];
+  for (let r = 1; r < work.length; r++) {
+    if (rowsToRemove.has(r)) manualRows.push(work[r] || []);
+    else cleanRows.push(work[r] || []);
+  }
+  if (manualRows.length) manualRows.unshift(work[0] || []);
+
+  return {
+    cleanRows,
+    manualRows,
+    changedCells,
+    changedSamples,
+    removedRows: rowsToRemove.size,
+    dataRows: Math.max(0, work.length - 1),
+  };
+}
+
+/* 近义映射表：别名 → 标准名（两列，首行表头），支持链式解析 */
+function uLoadSynonymMapFromRows(rows) {
+  const raw = new Map();
+  if (!rows || rows.length < 2) return raw;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const alias = row[0] == null ? "" : String(row[0]).trim();
+    const std = row[1] == null ? "" : String(row[1]).trim();
+    if (alias && std && alias !== std) raw.set(alias, std);
+  }
+  const resolved = new Map();
+  for (const [k, v] of raw) {
+    const seen = new Set([k]);
+    let cur = v;
+    while (raw.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      cur = raw.get(cur);
+    }
+    resolved.set(k, cur);
+  }
+  return resolved;
+}
+
+function uSplitTags(text) {
+  let s = String(text);
+  const saved = new Map();
+  U_ATOMIC_TAGS.forEach((t, i) => {
+    if (s.includes(t)) {
+      const ph = "\x01" + i + "\x01";
+      s = s.split(t).join(ph);
+      saved.set(ph, t);
+    }
+  });
+  return s
+    .split(U_SPLIT_RE)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => (saved.has(p) ? saved.get(p) : p));
+}
+
+function uApplySynonym(cleanRows, map) {
+  const result = { changedCells: 0, hits: {} };
+  if (!map || !map.size) return result;
+  const headerMap = uBuildHeaderMap(cleanRows);
+  const tagCols = [...headerMap.entries()]
+    .filter(([k]) => k.endsWith("对应标签"))
+    .map(([, c]) => c);
+  if (!tagCols.length) return result;
+
+  for (let r = 1; r < cleanRows.length; r++) {
+    const row = cleanRows[r];
+    if (!row) continue;
+    for (const c of tagCols) {
+      const v = row[c];
+      if (v == null || !String(v).trim()) continue;
+      const parts = uSplitTags(v);
+      const out = [];
+      let hit = false;
+      for (const t of parts) {
+        const nt = map.has(t) ? map.get(t) : t;
+        if (nt !== t) {
+          result.hits[t] = (result.hits[t] || 0) + 1;
+          hit = true;
+        }
+        if (nt && !out.includes(nt)) out.push(nt);
+      }
+      if (hit) {
+        const nv = out.join("、");
+        row[c] = nv || null;
+        result.changedCells++;
+      }
+    }
+  }
+  return result;
+}
+
+/* ---------------- 阶段 4 的 UI ---------------- */
+
+function uRowsFromWorkbook(buf) {
+  const wb = XLSX.read(buf, { type: "array", cellNF: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true, blankrows: true });
+  /* SheetJS 的 cellDates 转换有精度误差（会把 19:27:42 转成 19:26:59），
+   * 这里用 SSF.parse_date_code 自己转，保证与 Excel 显示一致 */
+  const ref = ws["!ref"];
+  if (ref) {
+    const range = XLSX.utils.decode_range(ref);
+    for (let r = range.s.r; r <= range.e.r; r++) {
+      for (let c = range.s.c; c <= range.e.c; c++) {
+        const cell = ws[XLSX.utils.encode_cell({ r, c })];
+        if (!cell || cell.t !== "n" || !cell.z) continue;
+        if (!XLSX.SSF.is_date(cell.z)) continue;
+        const d = XLSX.SSF.parse_date_code(cell.v);
+        if (!d) continue;
+        const ri = r - range.s.r;
+        const ci = c - range.s.c;
+        if (!rows[ri]) continue;
+        rows[ri][ci] = new Date(d.y, d.m - 1, d.d, d.H, d.M, Math.floor(d.S), Math.round((d.S % 1) * 1000));
+      }
+    }
+  }
+  return rows.map((r) => (r || []).map((v) => (typeof v === "string" ? v.replace(/\r\n/g, "\n") : v)));
+}
+
+function uSheetFromRows(rows) {
+  const ws = XLSX.utils.aoa_to_sheet(rows, { cellDates: true });
+  for (const addr in ws) {
+    if (addr[0] === "!") continue;
+    const c = ws[addr];
+    if (c && c.t === "d" && c.v instanceof Date) {
+      const d = c.v;
+      const hasTime = d.getHours() || d.getMinutes() || d.getSeconds();
+      c.z = hasTime ? "yyyy-mm-dd hh:mm:ss" : "yyyy-mm-dd";
+    }
+  }
+  return ws;
+}
+
+async function uLoadMapFile() {
+  try {
+    const fh = await getFile(APP.rootHandle, U_MAP_FILENAME, false);
+    const buf = await readFile(fh);
+    const rows = uRowsFromWorkbook(buf);
+    return { ok: true, map: uLoadSynonymMapFromRows(rows), rows: rows.length - 1 };
+  } catch (e) {
+    return { ok: false, map: new Map(), rows: 0, error: friendlyErr(e) };
+  }
+}
+
+async function uWriteUnified(subDir, srcBuf, cleanRows, manualRows, outName) {
+  const wb = XLSX.utils.book_new();
+  let src = null;
+  try {
+    src = XLSX.read(srcBuf, { type: "array" });
+  } catch (e) {
+    src = null;
+  }
+  if (src) {
+    for (const name of src.SheetNames) {
+      if (name === "清洗结果" || name === "手动识别") continue;
+      XLSX.utils.book_append_sheet(wb, src.Sheets[name], name);
+    }
+  }
+  XLSX.utils.book_append_sheet(wb, uSheetFromRows(cleanRows), "清洗结果");
+  if (manualRows && manualRows.length > 1) {
+    XLSX.utils.book_append_sheet(wb, uSheetFromRows(manualRows), "手动识别");
+  }
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array", cellDates: true });
+  const fh = await getFile(subDir, outName || "打标返回_统一化.xlsx", true);
+  await writeFile(fh, out);
+}
+
+async function renderStep4() {
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <h2 style="font-size:16px;font-weight:500;margin-bottom:6px">标签统一化</h2>
+    <p class="caption">把打标返回的标签归一到标准说法，输出含「清洗结果」sheet 的新文件。原始的「打标返回.xlsx」保留不动。</p>
+    <div id="step4-main"></div>`;
+  await renderStep4Body();
+}
+
+async function renderStep4Body() {
+  const host = document.getElementById("step4-main");
+  const projDir = await getDir(APP.rootHandle, APP.curProject, true);
+  let workDir = null;
+  try { workDir = await getDir(projDir, "work", false); } catch (e) { workDir = null; }
+  if (!workDir) {
+    host.innerHTML = `<div class="card"><h3>还没有 work 目录</h3><div class="hint warn">先完成阶段 2 的预处理。</div></div>`;
+    return;
+  }
+
+  let mapInfo;
+  try {
+    mapInfo = await uLoadMapFile();
+  } catch (e) {
+    mapInfo = { ok: false, map: new Map(), rows: 0 };
+  }
+
+  let html = "";
+  html += `<div class="card"><h3>近义映射表</h3>`;
+  if (mapInfo.ok) {
+    html += `<div class="hint ok">已读取：projects/${escapeHtml(U_MAP_FILENAME)}　共 ${mapInfo.rows} 条（改表后刷新本页即生效，无需重新发布）</div>`;
+  } else {
+    html += `<div class="hint warn">没有找到 <span class="mono">${escapeHtml(U_MAP_FILENAME)}</span>。把它放在你选择的 projects 根目录下即可；不放也能跑，只是不会做别名归一。</div>`;
+  }
+  html += `<div class="caption" style="margin-top:8px">格式：第一列「别名」、第二列「标准名」，首行是表头。</div></div>`;
+
+  /* ---------- 自有平台：work/<平台>/打标返回.xlsx ---------- */
+  const own = [];
+  for (const plat of OWN_PLATFORMS) {
+    let hasReturn = false;
+    let hasDone = false;
+    try {
+      const sub = await getDir(workDir, plat, false);
+      try {
+        await getFile(sub, "打标返回.xlsx", false);
+        hasReturn = true;
+      } catch (e) { hasReturn = false; }
+      try {
+        await getFile(sub, "打标返回_统一化.xlsx", false);
+        hasDone = true;
+      } catch (e) { hasDone = false; }
+    } catch (e) { /* 无该平台目录 */ }
+    own.push({
+      group: "own", key: plat, label: plat, dirName: plat,
+      inName: "打标返回.xlsx", outName: "打标返回_统一化.xlsx",
+      hasReturn, hasDone,
+    });
+  }
+
+  /* ---------- 三方站点：work/<产品> 三方 <站点>.xlsx（阶段2拆分产物） ---------- */
+  const third = [];
+  let entries = [];
+  try { entries = await listEntries(workDir); } catch (e) { entries = []; }
+  const thirdNames = entries
+    .filter((e) => e.kind === "file"
+      && /\.xlsx$/i.test(e.name)
+      && e.name.includes(" 三方 ")
+      && !/_统一化\.xlsx$/i.test(e.name)
+      && !/^~\$/.test(e.name))
+    .map((e) => e.name)
+    .sort((a, b) => {
+      const rank = (n) => {
+        const site = n.slice(n.lastIndexOf(" 三方 ") + 4).replace(/\.xlsx$/i, "");
+        const i = THIRD_PLATFORMS.indexOf(site);
+        return i < 0 ? 99 : i;
+      };
+      return rank(a) - rank(b) || a.localeCompare(b, "zh");
+    });
+  for (const name of thirdNames) {
+    const site = name.slice(name.lastIndexOf(" 三方 ") + 4).replace(/\.xlsx$/i, "");
+    const outName = name.replace(/\.xlsx$/i, "") + "_统一化.xlsx";
+    let hasDone = false;
+    try {
+      await getFile(workDir, outName, false);
+      hasDone = true;
+    } catch (e) { hasDone = false; }
+    third.push({
+      group: "third", key: "三方:" + site, label: site, dirName: null,
+      inName: name, outName, hasReturn: true, hasDone,
+    });
+  }
+
+  const rowHtml = (st) => {
+    let line;
+    if (!st.hasReturn) line = `<span class="hint warn">缺少 打标返回.xlsx（先完成阶段 3）</span>`;
+    else if (st.hasDone) line = `<span class="hint ok">已统一化（可重跑覆盖）</span>`;
+    else line = `<span class="hint info">已就位，待统一化</span>`;
+    const sub = st.group === "third" ? `<span class="mono" style="opacity:.6;font-size:12px">　${escapeHtml(st.inName)}</span>` : "";
+    return `<div class="row" style="margin-top:8px"><div class="col"><b>${escapeHtml(st.label)}</b>${sub}</div><div class="col">${line}</div></div>`;
+  };
+
+  html += `<div class="card"><h3>自有平台</h3>`;
+  html += `<div class="caption" style="margin-bottom:8px">阶段 3 传回的 打标返回.xlsx</div>`;
+  html += own.map(rowHtml).join("");
+  html += `</div>`;
+
+  html += `<div class="card"><h3>三方平台</h3>`;
+  if (!third.length) {
+    html += `<div class="hint warn">没有找到三方拆分文件（阶段 2 产物：<span class="mono">work/&lt;产品&gt; 三方 &lt;站点&gt;.xlsx</span>）</div>`;
+  } else {
+    html += `<div class="caption" style="margin-bottom:8px">阶段 2 按站点拆分出来的文件</div>`;
+    html += third.map(rowHtml).join("");
+  }
+  html += `</div>`;
+
+  const all = own.concat(third);
+  const readyCount = all.filter((s) => s.hasReturn).length;
+  html += `<div class="card"><div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">`;
+  html += `<button id="btn-unify">开始统一化（${readyCount} 个文件）</button>`;
+  html += `<span class="caption">原始文件不会被改动，结果另存为 *_统一化.xlsx</span></div>`;
+  html += `<div id="unify-status"></div></div>`;
+  host.innerHTML = html;
+
+  document.getElementById("btn-unify").onclick = async () => {
+    const btn = document.getElementById("btn-unify");
+    const status = document.getElementById("unify-status");
+    btn.disabled = true;
+    status.innerHTML = "";
+    const lines = [];
+    let anyOk = false;
+
+    for (const st of all) {
+      if (!st.hasReturn) continue;
+      try {
+        const dir = st.group === "own" ? await getDir(workDir, st.dirName, false) : workDir;
+        const fh = await getFile(dir, st.inName, false);
+        const buf = await readFile(fh);
+        const rows = uRowsFromWorkbook(buf);
+        if (!rows.length) throw new Error("文件是空的");
+
+        const proc = uProcessRows(rows);
+        const syn = uApplySynonym(proc.cleanRows, mapInfo.map);
+        await uWriteUnified(dir, buf, proc.cleanRows, proc.manualRows, st.outName);
+
+        APP.state.unified = APP.state.unified || {};
+        APP.state.unified[st.key] = true;
+
+        const hitPairs = Object.entries(syn.hits)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([k, v]) => `${k}(${v})`)
+          .join("、");
+
+        lines.push(
+          `<div class="hint ok" style="margin-top:6px"><b>${escapeHtml(st.group === "third" ? "三方 " + st.label : st.label)}</b>：` +
+          `数据 ${proc.dataRows} 行 → 清洗结果 ${proc.cleanRows.length - 1} 行` +
+          (proc.removedRows ? `，手动识别 ${proc.removedRows} 行` : "") +
+          `；归一 ${proc.changedCells} 个单元格` +
+          (syn.changedCells ? `，映射 ${syn.changedCells} 个单元格${hitPairs ? "（" + escapeHtml(hitPairs) + "）" : ""}` : "") +
+          `</div>`
+        );
+        anyOk = true;
+      } catch (e) {
+        lines.push(`<div class="hint err" style="margin-top:6px"><b>${escapeHtml(st.group === "third" ? "三方 " + st.label : st.label)}</b>：${escapeHtml(friendlyErr(e))}</div>`);
+      }
+    }
+
+    if (anyOk) {
+      await saveState();
+      lines.push(`<div class="hint info" style="margin-top:10px">结果已写入：自有 <span class="mono">work/&lt;平台&gt;/打标返回_统一化.xlsx</span>；三方 <span class="mono">work/&lt;产品&gt; 三方 &lt;站点&gt;_统一化.xlsx</span></div>`);
+    }
+    status.innerHTML = lines.join("");
+    btn.disabled = false;
+    await renderStep4Body();
+    const again = document.getElementById("unify-status");
+    if (again) again.innerHTML = lines.join("");
+  };
 }
 
 async function boot() {

@@ -1,2 +1,8 @@
 # xlsx.full.min.js 已内联进 index.html，无需上传
 xlsx.full.min.js
+
+# 本地备份不发布
+backup_*/
+_recon*/
+_*.py
+_*.js
